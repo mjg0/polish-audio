@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+
+# polish-audio
+
+# Michael Greenburg 2020-07-23
+# This script was inspired by http://www.zoharbabin.com/how-to-do-noise-reduction-using-ffmpeg-and-sox/
+# Uses mktemp to create a directory to hold intermediate audio files--make sure you have enough space in /tmp or $TMPDIR
+
+
+
+
+
+# PARSING PARAMETERS ###################################################################################################
+
+# Basic options
+VERBOSE=no
+DRY_RUN=no
+PAUSE=no
+FORCE=no
+AUDIO_ONLY=no
+AUDIO_FORMAT=wav
+
+# Sox and ffmpeg options
+SOX_OPTIONS='bandpass 500 8o loudness -5 norm -1' # default to a bandpass filter (center 500Hz, 8 octaves wide--lets
+                                                  # through 31Hz to 8kHz, containing almost all human voices), a
+                                                  # loudness reduction of 5dB, and normalization to -1dB
+SOX_NOISERED_AMOUNT=0.25
+SOX_NOISE_WINDOW=00:00:01-00:00:05 # see --noise-window option
+SOX_VERBOSITY=1
+FFMPEG_VERBOSITY=error
+
+# Colors for ffmpeg and sox
+FFMPEG_COLOR=5 # magenta
+SOX_COLOR=3 # yellow
+export AV_LOG_FORCE_NOCOLOR=yes # make ffmpeg use our color
+
+# Make sure that we pass ffmpeg acceptable times from which to draw the noise sample
+TIME_REGEX='(([0-9]+:)?[0-5][0-9](:[0-5][0-9](.[0-9]+)?)?|[0-9]+(.[0-9]+)?)' # see ffmpeg-utils(1)
+
+########################################################################################################################
+
+
+
+
+
+# USAGE ################################################################################################################
+
+SYNOPSIS="polish-audio: a script that polishes and removes noise from audio, specialized for voice recordings"
+USAGE="polish-audio [flags] [--] input1.mkv [input2.mkv ...] output.mkv"
+DESCRIPTION=\
+"polish-audio takes any number of input files, removes noise from and further polishes their audio, and concatenates them
+into a single output file. SoX and FFmpeg are required to run polish-audio.
+
+Input files can be either video or audio files. If at least one input file is an audio file, the output will also be an
+audio file. '--audio-only' can be specified to force audio output even if all input files are videos.
+
+The output file cannot exist unless the '--force' flag is used. The output file may not be among the input files.
+
+SoX, which polish-audio uses for audio manipulation, is very powerful. If the default settings of polish-audio don't
+produce good results, you can use '--sox-options' to pass an arbitrary set of effects that SoX will use to process your
+audio.
+
+You will need to specify a piece of an input file to be used as a noise sample; a section of \"silence\" is what SoX
+uses to remove noise. By default, this is seconds 1 to 5 of the first specified input file, under the assumption that
+the first 5 seconds of the recording will contain no useful audio; it can be specified with '--noise-window'."
+FLAGS="Flags:
+    --                  no more flags follow; put any input or output files starting with '-' after this
+    -h|--help           print a help message and exit
+    -v|--verbose        print what is being done while it is happening
+    -n|--dry-run        don't actually execute anything; rather, show what would have been executed
+    -p|--pause          pause after audio is processed and before concatenation; allows one to further polish each clip
+    -f|--force          overwrite the output file if it already exists
+    -a|--audio-only     even if all input files are video, only output the concatenated polished audio
+    -w|--noise-window starttime-endtime[-N]
+                        the time period of the Nth input file (1st by default) from which to take a noise sample
+                        starttime and endtime can be of the format [HH:]MM:SS[.m...] or S[.m...] (see ffmpeg-util(1))
+                        N can also be the name of a file from which to take the noise sample
+    -o|--output-file filename.mkv
+                        the name of the output file; if not specified, the last file specified will be used
+    -s|--sox-options 'effect1 value1 effect2 \"value 2a\" value2b'
+                        options sox will use in processing audio files; defaults to '$SOX_OPTIONS'
+    -r|--noise-reduction N
+                        A number (0 to 1) specifying how aggressively to remove noise; defaults to $SOX_NOISERED_AMOUNT"
+EPILOG="See sox(1) for a list of effects that can be passed via --sox-options"
+
+########################################################################################################################
+
+
+
+
+
+# HELPER FUNCTIONS #####################################################################################################
+
+# Print a message and die
+error_exit() {
+    STATUS=$1
+    shift
+    echo "ERROR: $@; aborting"
+    exit $STATUS
+}
+
+# Echo if verbose
+vecho() {
+    [[ "$VERBOSE" == yes ]] && echo "$@"
+}
+
+# Execute if not dry run, otherwise print what would have been executed, preserving quoting
+neval() {
+    if [[ "$DRY_RUN" == yes ]]; then
+        echo -n ">>> "
+        while [ $# -gt 0 ]; do
+            [[ -z "$1" || "$1" =~ \ + ]] && echo -n "'$1' " || echo -n "$1 "
+            shift
+        done
+        echo
+    else
+        "$@"
+    fi
+}
+
+# Wrappers for ffmpeg and sox, which change the color so the user can tell where messages are coming from
+# These use neval so that if --dry-run is specified, nothing will actually be executed
+ffmpeg_wrapper() {
+    tput setaf $FFMPEG_COLOR
+    neval ffmpeg -y -v $FFMPEG_VERBOSITY "$@"
+    tput sgr0
+}
+sox_wrapper() {
+    tput setaf $SOX_COLOR
+    neval sox -V$SOX_VERBOSITY "$@"
+    tput sgr0
+}
+
+########################################################################################################################
+
+
+
+
+
+# PARSE ################################################################################################################
+
+# Get user input
+FILES=()
+unset OUTFILE
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -h|--help)
+        echo "$SYNOPSIS"; echo
+        echo "$USAGE"; echo
+        echo "$DESCRIPTION"; echo
+        echo "$FLAGS"; echo
+        echo "$EPILOG"
+        exit
+        ;;
+    -v|--verbose)
+        VERBOSE=yes
+        FFMPEG_VERBOSITY=warning
+        SOX_VERBOSITY=2
+        ;;
+    -n|--dry-run)
+        DRY_RUN=yes
+        ;;
+    -p|--pause)
+        PAUSE=yes
+        ;;
+    -f|--force)
+        FORCE=yes
+        ;;
+    -a|--audio-only)
+        AUDIO_ONLY=yes
+        ;;
+    -w=*|--noise-window=*)
+        SOX_NOISE_WINDOW="${1#*=}"
+        ;;
+    -w|--noise-window)
+        shift
+        SOX_NOISE_WINDOW="$1"
+        ;;
+    -o=*|--output-file=*)
+        OUTFILE="${1#*=}"
+        ;;
+    -o|--output-file)
+        shift
+        OUTFILE="$1"
+        ;;
+    -s=*|--sox-options=*)
+        SOX_OPTIONS="${1#*=}"
+        ;;
+    -s|--sox-options)
+        shift
+        SOX_OPTIONS="$1"
+        ;;
+    -r=*|--noise-reduction=*)
+        SOX_NOISERED_AMOUNT="${1#*=}"
+        ;;
+    -r|--noise-reduction)
+        shift
+        SOX_NOISERED_AMOUNT="$1"
+        ;;
+    --)
+        shift
+        FILES+=("$@")
+        break
+        ;;
+    -*)
+        error_exit 2 "unrecognized flag '$1'"
+        ;;
+    *)
+        FILES+=("$1")
+    esac
+    shift
+done
+
+# Separate out input and output files
+[[ "${#FILES[@]}" -lt 1 ]] && error_exit 2 "No input files specified"
+if [ -z "$OUTFILE" ]; then
+    [[ "${#FILES[@]}" -lt 2 ]] && error_exit 2 "No output file specified"
+    OUTFILE="${FILES[-1]}"
+    unset FILES[-1]
+fi
+[[ -f "$OUTFILE" && "$FORCE" != yes ]] && \
+        error_exit 1 "existing output file '$OUTFILE' can't be overwritten without '--force' flag"
+for INFILE in "${FILES[@]}"; do
+    [[ ! -f "$INFILE" ]] && error_exit 2 "input file '$INFILE' doesn't exist"
+    [[ "$INFILE" == "$OUTFILE" ]] && error_exit 2 "input file '$INFILE' cannot also be used as the output file"
+done
+
+# Confirm that the noise window is legit
+IFS=- read -r NOISE_START NOISE_END NOISE_INFILE <<< "$SOX_NOISE_WINDOW"
+[[ "$NOISE_START-$NOISE_END" =~ ^$TIME_REGEX-$TIME_REGEX$ ]] \
+        || error_exit 2 "invalid noise window '$SOX_NOISE_WINDOW' specified"
+[[ -z "$NOISE_INFILE" ]] && NOISE_INFILE=1
+if [[ "$NOISE_INFILE" =~ ^[0-9]+$ ]]; then # refers to the Nth input file
+    [[ "$NOISE_INFILE" -lt 1 || "$NOISE_INFILE" -gt ${#FILES[@]} ]] && \
+            error_exit 2 "noise infile must be an integer from 1 to ${#FILES[@]}"
+    NOISE_INFILE="${FILES[$NOISE_INFILE-1]}"
+else # refers to a filename
+    [[ -f "$NOISE_INFILE" ]] || error_exit 1 "noise sample file '$NOISE_INFILE' doesn't exist"
+fi
+
+# Split sox options into an array
+IFS=$'\n' SOX_ARGS=($(xargs -n 1 <<<"$SOX_OPTIONS")) # xargs honors quotes
+
+# Show parsed values if --verbose was specified
+vecho "Finished parsing; values:"
+vecho "    Dry run:           $DRY_RUN"
+vecho "    Audio only:        $AUDIO_ONLY"
+vecho "    Noise window:      $SOX_NOISE_WINDOW"
+vecho "    Noise sample file: $NOISE_INFILE"
+vecho "    Input file(s):     ${FILES[0]}"
+for ((i=1; i<${#FILES[@]}; i++)); do
+    vecho "                       ${FILES[$i]}"
+done
+vecho "    Output file:       $OUTFILE"
+vecho "    sox options:       $SOX_OPTIONS"
+
+########################################################################################################################
+
+
+
+
+
+# PROCESS ##############################################################################################################
+
+# Check that ffmpeg and sox are available if we'll actually be using them
+if [ "$DRY_RUN" != yes ]; then
+    which ffmpeg &>/dev/null || error_exit 1 "ffmpeg is not installed"
+    which sox &>/dev/null    || error_exit 1 "sox is not installed"
+fi
+
+# Create a directory to store intermediate data and set a trap to remove it on termination
+export TMPDIR="$(mktemp -d -t polish-audio-XXXX)"
+cleanup_and_exit() {
+    STATUS=$?
+    vecho "Cleaning up intermeidate files"
+    rm -r "$TMPDIR"
+    exit $STATUS
+}
+trap cleanup_and_exit EXIT
+
+# Get the noise sample
+vecho "Generating noise sample"
+NOISE_SLICE="$(mktemp -t "noise-slice-$(basename "$NOISE_INFILE")-XXXX.$AUDIO_FORMAT")"
+NOISE_SAMPLE="$(mktemp -t noise-sample-$(basename "$NOISE_INFILE")-XXXX.prof)"
+ffmpeg_wrapper -i "$NOISE_INFILE" -ss "$NOISE_START" -to "$NOISE_END" -vn "$NOISE_SLICE" \
+        || error_exit 1 "ffmpeg failed to slice noise sample for sox"
+sox_wrapper "$NOISE_SLICE" -n noiseprof "$NOISE_SAMPLE" \
+        || error_exit 1 "sox failed to produce noise profile"
+
+# Extract and massage audio from all input files
+FIXED_AUDIO=()
+for INFILE in "${FILES[@]}"; do
+    vecho "Processing input file $INFILE"
+
+    # Check whether this infile is a video
+    if [[ "$AUDIO_ONLY" != yes ]]; then
+        if [[ -z "$(ffprobe -i "$INFILE" -show_streams -select_streams v -loglevel error 2>/dev/null)" ]]; then
+            AUDIO_ONLY=yes
+            echo "Non-video input file '$INFILE' found; output will be audio only"
+        fi
+    fi
+
+    # Split out audio
+    vecho "    splitting out audio"
+    RAW_AUDIO="$(mktemp -t "raw-audio-$(basename "$INFILE")-XXXX.$AUDIO_FORMAT")"
+    ffmpeg_wrapper -i "$INFILE" -vn "$RAW_AUDIO" || error_exit 1 "ffmpeg failed on input '$INFILE'"
+
+    # Massage the audio
+    vecho "    fixing audio"
+    FIXED_AUDIO+=("$(mktemp -t "fixed-audio-$(basename "$INFILE")-XXXX.$AUDIO_FORMAT")")
+    sox_wrapper "$RAW_AUDIO" "${FIXED_AUDIO[-1]}" \
+                noisered "$NOISE_SAMPLE" "$SOX_NOISERED_AMOUNT" "${SOX_ARGS[@]}" \
+            || error_exit 1 "sox failed on input '$INFILE'"
+
+    # Clean up what we no longer need
+    rm "$RAW_AUDIO"
+done
+
+# Pause if required so that the user can hand-tune the fixed audio files
+[[ "$PAUSE" == yes ]] && read -p "
+Pausing--press enter to continue
+Feel free to modify the polished audio files in $TMPDIR; changes will be reflected in the output file
+"
+
+# Merge everything
+vecho "Merging input files with fixed audio"
+if [[ "$AUDIO_ONLY" == yes ]]; then # all we need to do is concatenate the fixed audio files
+    sox_wrapper "${FIXED_AUDIO[@]}" "$OUTFILE"
+else # we need to use ffmpeg to combine the original video with the fixed audio
+    VIDEOS=()
+    AUDIOS=()
+    for i in "${!FILES[@]}"; do
+        VIDEOS+=(-i "${FILES[$i]}")
+        AUDIOS+=(-i "${FIXED_AUDIO[$i]}")
+        VIDEO_SPECS="$VIDEO_SPECS[$i:v:0]"
+        AUDIO_SPECS="$AUDIO_SPECS[$(($i+${#FILES[@]})):a:0]"
+    done
+    ffmpeg_wrapper "${VIDEOS[@]}" "${AUDIOS[@]}" -filter_complex \
+                   "$VIDEO_SPECS concat=n=${#FILES[@]}:v=1:a=0 [v], $AUDIO_SPECS concat=n=${#FILES[@]}:v=0:a=1 [a]" \
+                   -map "[v]" -map "[a]" "$OUTFILE"
+fi
+vecho "Finished writing to '$OUTFILE'"
+
+########################################################################################################################
+
+
+
+
+
+# TODO: better method for specifying noise window--whole clip, duration from end of video rather than beginning, etc.
+# TODO: create output file automatically if one isn't specified?
+# TODO: maybe choose a format to convert everything to with ffmpeg in case weird stuff that sox can't handle gets used
+# TODO: add --mufasa or --james-earl-jones flag (adjust pitch and timbre probably?); possibly others
+# TODO: will using ffmpeg like I do get rid of the subtitle or data streams if there are any?
+# TODO: print everything to stderr so that the user can specify '-' as the outfile so it just goes to stdout
+# TODO: add a '--transcript=whatever.txt' flag that automatically converts the audio to text that can then be fixed up; maybe even only output the transcript as an option?
